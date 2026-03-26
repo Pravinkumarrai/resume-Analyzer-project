@@ -1,304 +1,486 @@
 import streamlit as st
 import pickle
 import docx
-import PyPDF2
 import re
-import matplotlib.pyplot as plt
 import pandas as pd
-import sqlite3
+import matplotlib.pyplot as plt
 from datetime import datetime
+from pymongo import MongoClient
+import pdfplumber
 
-# -------- DATABASE --------
-conn = sqlite3.connect("resumes.db", check_same_thread=False)
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS resumes(
-id INTEGER PRIMARY KEY AUTOINCREMENT,
-file_name TEXT,
-category TEXT,
-upload_date TEXT
+# ---------------- PAGE CONFIG ----------------
+st.set_page_config(
+    page_title="AI Resume Analyzer",
+    layout="wide"
 )
-""")
 
-conn.commit()
+# ---------------- MONGODB ----------------
+client = MongoClient("mongodb://localhost:27017/")
+db = client["resume_db"]
+collection = db["resumes"]
 
-# ---------------- LOAD TRAINED MODEL ----------------
-svc_model = pickle.load(open("model.pkl", "rb"))
-tfidf = pickle.load(open("tfidf.pkl", "rb"))
-le = pickle.load(open("encoder.pkl", "rb"))
+# ---------------- LOAD MODEL ----------------
+svc_model = pickle.load(open("model.pkl","rb"))
+tfidf = pickle.load(open("tfidf.pkl","rb"))
+le = pickle.load(open("encoder.pkl","rb"))
 
-# ---------------- CLEANING FUNCTION ----------------
+# ---------------- CLEAN TEXT ----------------
 def cleanResume(txt):
-    cleanText = re.sub(r'http\S+\s', ' ', txt)
-    cleanText = re.sub(r'RT|cc', ' ', cleanText)
-    cleanText = re.sub(r'#\S+\s', ' ', cleanText)
-    cleanText = re.sub(r'@\S+', ' ', cleanText)
-    cleanText = re.sub(r'[%s]' % re.escape("""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""), ' ', cleanText)
-    cleanText = re.sub(r'[^\x00-\x7f]', ' ', cleanText)
-    cleanText = re.sub(r'\s+', ' ', cleanText)
-    return cleanText
+
+    txt = txt.lower()
+
+    txt = re.sub(r'http\S+', ' ', txt)
+
+    txt = re.sub(r'[^a-zA-Z ]', ' ', txt)
+
+    txt = re.sub(r'\s+', ' ', txt)
+
+    return txt
 
 
-# ---------------- FILE EXTRACTORS ----------------
+# ---------------- EXTRACT TEXT ----------------
 def extract_text_from_pdf(file):
-    reader = PyPDF2.PdfReader(file)
-    text = ""
-    for page in reader.pages:
-        page_text = page.extract_text()
-        if page_text:
-            text += page_text
+
+    text=""
+
+    with pdfplumber.open(file) as pdf:
+
+        for page in pdf.pages:
+
+            text+=page.extract_text() or ""
+
     return text
 
 
 def extract_text_from_docx(file):
-    doc = docx.Document(file)
+
+    doc=docx.Document(file)
+
     return "\n".join([p.text for p in doc.paragraphs])
 
 
 def extract_text_from_txt(file):
-    data = file.read()
-    try:
-        return data.decode("utf-8")
-    except:
-        return data.decode("latin-1")
+
+    return file.read().decode("utf-8",errors="ignore")
 
 
-# ---------------- PREDICTION ----------------
-def pred(input_resume):
-    cleaned = cleanResume(input_resume)
-    vector = tfidf.transform([cleaned])
-    result = svc_model.predict(vector)
-    return le.inverse_transform(result)[0]
+# ---------------- EXTRACT INFO ----------------
+def extract_email(text):
+
+    match=re.findall(r'\S+@\S+',text)
+
+    return match[0] if match else "Not found"
 
 
-# ---------------- SKILL KEYWORDS ----------------
-skill_keywords = {
-    "Programming": ["python", "java", "c++", "javascript", "c#", "sql", "html", "css"],
-    "Machine Learning": ["machine learning", "deep learning", "tensorflow", "pytorch", "data analysis"],
-    "Web Development": ["react", "node", "express", "django", "flask"],
-    "Cloud & DevOps": ["aws", "azure", "gcp", "docker", "kubernetes", "devops"],
-    "Tools": ["git", "jira", "tableau", "power bi", "excel"]
+def extract_phone(text):
+
+    match=re.findall(r'\b\d{10}\b',text)
+
+    return match[0] if match else "Not found"
+
+
+def extract_name(text):
+
+    blacklist=[
+        "resume","curriculum","vitae",
+        "profile","contact","email",
+        "phone","education","skills",
+        "experience","objective"
+    ]
+
+    lines=text.split("\n")
+
+    for line in lines[:10]:
+
+        line=line.strip()
+
+        if len(line)==0:
+            continue
+
+        if any(word in line.lower() for word in blacklist):
+            continue
+
+        if any(char.isdigit() for char in line):
+            continue
+
+        if "@" in line:
+            continue
+
+        words=line.split()
+
+        if 2<=len(words)<=4:
+
+            if all(w.isalpha() for w in words):
+
+                return line.title()
+
+    return "Unknown"
+
+
+# ---------------- CATEGORY ----------------
+def predict_category(text):
+
+    text_lower=text.lower()
+
+    if "python" in text_lower or "machine learning" in text_lower:
+        return "Data Science"
+
+    if "react" in text_lower or "javascript" in text_lower:
+        return "Web Developer"
+
+    if "java" in text_lower:
+        return "Java Developer"
+
+    if "recruitment" in text_lower or "talent acquisition" in text_lower:
+        return "HR"
+
+    cleaned=cleanResume(text)
+
+    vec=tfidf.transform([cleaned])
+
+    pred=svc_model.predict(vec)
+
+    return le.inverse_transform(pred)[0]
+
+
+# ---------------- SKILLS ----------------
+skill_keywords={
+
+"Programming":["python","java","c++","sql"],
+
+"ML":["machine learning","tensorflow","pytorch"],
+
+"Web":["react","node","django","flask"],
+
+"Cloud":["aws","docker","kubernetes"]
+
 }
 
-achievement_keywords = [
-    "award", "certification", "certificate",
-    "achieved", "winner", "rank", "hackathon"
-]
-
-
-# ---------------- SKILL ANALYSIS ----------------
 def analyze_skills(text):
 
-    counts = {cat: 0 for cat in skill_keywords}
+    counts={k:0 for k in skill_keywords}
 
-    text = text.lower()
+    text=text.lower()
 
-    for cat, keys in skill_keywords.items():
-        for k in keys:
-            if k in text:
-                counts[cat] += 1
+    for cat,words in skill_keywords.items():
 
-    df = pd.DataFrame({
-        "Category": counts.keys(),
-        "Count": counts.values()
+        for w in words:
+
+            if w in text:
+
+                counts[cat]+=1
+
+    return pd.DataFrame({
+
+        "Category":list(counts.keys()),
+
+        "Count":list(counts.values())
+
     })
 
-    return df
 
+# ---------------- ACHIEVEMENTS ----------------
+achievement_keywords=[
 
-# ---------------- ACHIEVEMENT ANALYSIS ----------------
+"award","certification",
+"winner","rank","hackathon"
+
+]
+
 def analyze_achievements(text):
 
-    text = text.lower()
+    text=text.lower()
 
-    achievement_count = sum(text.count(word) for word in achievement_keywords)
+    count=sum(text.count(w) for w in achievement_keywords)
 
-    total_words = len(text.split())
+    total=len(text.split())
 
-    other_content = max(total_words/100 - achievement_count, 1)
+    other=max(total/100-count,1)
 
-    df = pd.DataFrame({
-        "Type": ["Achievements", "Other Content"],
-        "Count": [achievement_count, other_content]
+    df=pd.DataFrame({
+
+        "Type":["Achievements","Other"],
+
+        "Count":[count,other]
+
     })
 
-    return df, achievement_count
+    return df,count
 
 
-# ---------------- RESUME SCORING ----------------
-def resume_score(text, skill_df, achievement_df):
+# ---------------- SCORE ----------------
+def resume_score(text,skill_df,ach_df):
 
-    score = 0
-    suggestions = []
+    score=0
 
-    word_count = len(text.split())
+    suggestions=[]
 
-    if word_count > 500:
-        score += 20
+    if len(text.split())>400:
+        score+=20
     else:
-        suggestions.append("Add more details about projects and experience.")
+        suggestions.append("Add more content")
 
-    skill_count = skill_df["Count"].sum()
-
-    if skill_count >= 5:
-        score += 30
+    if skill_df["Count"].sum()>=4:
+        score+=30
     else:
-        suggestions.append("Include more technical skills.")
+        suggestions.append("Add more skills")
 
-    ach_count = achievement_df["Count"].iloc[0]
-
-    if ach_count > 0:
-        score += 20
+    if ach_df["Count"].iloc[0]>0:
+        score+=20
     else:
-        suggestions.append("Add certifications, awards, or hackathon achievements.")
+        suggestions.append("Add achievements")
 
     if "project" in text.lower():
-        score += 20
+        score+=20
     else:
-        suggestions.append("Mention at least one strong project.")
+        suggestions.append("Add projects")
 
-    if "university" in text.lower() or "college" in text.lower():
-        score += 10
+    if "education" in text.lower():
+        score+=10
     else:
-        suggestions.append("Include education details clearly.")
+        suggestions.append("Add education")
 
-    return score, suggestions
+    return score,suggestions
 
 
-# ---------------- STREAMLIT APP ----------------
+# ---------------- SCORE UI ----------------
+def display_score(score):
+
+    if score>=80:
+        color="green"
+        label="Excellent"
+    elif score>=60:
+        color="orange"
+        label="Good"
+    else:
+        color="red"
+        label="Needs Improvement"
+
+    st.markdown(
+
+        f"""
+
+        <div style="
+        background-color:#f5f7fa;
+        padding:25px;
+        border-radius:15px;
+        text-align:center">
+
+        <h1 style="color:{color};font-size:55px">
+        {score}/100
+        </h1>
+
+        <h3 style="color:gray">
+        {label}
+        </h3>
+
+        </div>
+
+        """,
+
+        unsafe_allow_html=True
+
+    )
+
+    st.progress(score/100)
+
+
+# ---------------- APP ----------------
 def main():
 
     st.set_page_config(
-        page_title="Resume Analyzer",
-        page_icon="📄",
+        page_title="AI Resume Analyzer",
         layout="wide"
     )
 
-    st.title("📄 AI Resume Analyzer")
+    st.title("AI Resume Analyzer")
 
-    st.write(
-        "Upload your resume to get job category prediction, skill insights, achievements analysis and improvement suggestions."
-    )
+    uploaded=st.file_uploader(
 
-    uploaded = st.file_uploader(
         "Upload Resume",
-        type=["pdf", "docx", "txt"]
+
+        type=["pdf","docx","txt"]
+
     )
 
     if uploaded:
 
-        try:
+        ext=uploaded.name.split(".")[-1]
 
-            ext = uploaded.name.split(".")[-1].lower()
+        if ext=="pdf":
+            text=extract_text_from_pdf(uploaded)
 
-            if ext == "pdf":
-                text = extract_text_from_pdf(uploaded)
+        elif ext=="docx":
+            text=extract_text_from_docx(uploaded)
 
-            elif ext == "docx":
-                text = extract_text_from_docx(uploaded)
+        else:
+            text=extract_text_from_txt(uploaded)
 
-            else:
-                text = extract_text_from_txt(uploaded)
+        st.success("Resume Uploaded")
 
-            st.success("File Uploaded Successfully")
+        col1,col2=st.columns(2)
 
-            if st.checkbox("Show Extracted Resume Text"):
-                st.text_area("Resume Text", text, height=300)
+        name=extract_name(text)
 
-            # ---------- Prediction ----------
-            st.subheader("Predicted Job Category")
+        if name=="Unknown":
+            name=uploaded.name.replace(".pdf","")
 
-            category = pred(text)
+        email=extract_email(text)
 
-            st.success(f"✔ {category}")
+        phone=extract_phone(text)
 
-            # ---------- Save to Database ----------
-            date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with col1:
 
-            cursor.execute(
-                "INSERT INTO resumes (file_name, category, upload_date) VALUES (?, ?, ?)",
-                (uploaded.name, category, date)
-            )
+            st.write("Name:",name)
 
-            conn.commit()
+            st.write("Email:",email)
 
-            # ---------- Skill Analysis ----------
-            st.subheader("📊 Skills Detected")
+            st.write("Phone:",phone)
 
-            skill_df = analyze_skills(text)
+        category=predict_category(text)
 
-            st.bar_chart(skill_df.set_index("Category"))
+        with col2:
 
-            # ---------- Achievement Analysis ----------
-            st.subheader("🏆 Achievements Analysis")
+            st.info("Category: "+category)
 
-            ach_df, ach_count = analyze_achievements(text)
+        skill_df=analyze_skills(text)
 
-            col1, col2 = st.columns(2)
+        st.subheader("Skill Analysis")
 
-            with col1:
-                st.metric("Achievements Found", ach_count)
+        st.bar_chart(
 
-                if ach_count == 0:
-                    st.warning("No achievements detected. Consider adding certifications or awards.")
+            skill_df.set_index("Category")
 
-            with col2:
+        )
 
-                fig, ax = plt.subplots(figsize=(3,3))
+        ach_df,ach_count=analyze_achievements(text)
 
-                ax.pie(
-                    ach_df["Count"],
-                    labels=ach_df["Type"],
-                    autopct="%1.0f%%",
-                    startangle=90,
-                    wedgeprops=dict(width=0.4)
-                )
+        score,suggestions=resume_score(
 
-                ax.set_title("Achievement Distribution")
+            text,
 
-                st.pyplot(fig)
+            skill_df,
 
-            # ---------- Resume Score ----------
-            st.subheader("📈 Resume Score")
+            ach_df
 
-            score, suggestions = resume_score(text, skill_df, ach_df)
+        )
 
-            st.progress(score/100)
+        st.subheader("Resume Score")
 
-            st.success(f"Resume Score: {score}/100")
+        display_score(score)
 
-            # ---------- Suggestions ----------
-            st.subheader("💡 Resume Improvement Suggestions")
+        st.subheader("Suggestions")
 
-            if suggestions:
-                for s in suggestions:
-                    st.write(f"• {s}")
-            else:
-                st.success("Your resume looks strong!")
+        for s in suggestions:
 
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
+            st.write("-",s)
 
-    # ---------- Admin Dashboard ----------
+        existing=collection.find_one({
+
+            "file_name":uploaded.name
+
+        })
+
+        if not existing:
+
+            data={
+
+                "name":name,
+
+                "email":email,
+
+                "phone":phone,
+
+                "file_name":uploaded.name,
+
+                "category":category,
+
+                "skills":skill_df.to_dict(
+
+                    orient="records"
+
+                ),
+
+                "score":score,
+
+                "date":datetime.utcnow()
+
+            }
+
+            collection.insert_one(data)
+
+            st.success("Saved to MongoDB")
+
+    # dashboard
     st.divider()
 
-    st.subheader("📂 Uploaded Resume Records")
+    st.subheader("Stored Resumes")
 
-    data = cursor.execute("SELECT * FROM resumes").fetchall()
+    records=list(
 
-    if data:
+        collection.find({},{"_id":0})
 
-        df = pd.DataFrame(
-            data,
-            columns=["ID", "File Name", "Category", "Upload Date"]
-        )
+    )
+
+    if records:
+
+        df=pd.DataFrame(records)
+
+        if "skills" in df.columns:
+
+            df["skills"]=df["skills"].apply(
+
+                lambda x:", ".join(
+
+                    [
+
+                        f"{i['Category']}({i['Count']})"
+
+                        for i in x
+
+                    ]
+
+                )
+
+            )
 
         st.dataframe(df)
 
+        # leaderboard
+        st.subheader("Top Candidates")
+
+        top=df.sort_values(
+
+            "score",
+
+            ascending=False
+
+        ).head(5)
+
+        st.table(
+
+            top[["name","category","score"]]
+
+        )
+
+        # download
+        csv=df.to_csv(index=False)
+
+        st.download_button(
+
+            "Download Report",
+
+            csv,
+
+            "resume_data.csv"
+
+        )
+
     else:
-        st.info("No resumes uploaded yet.")
+
+        st.info("No data available")
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
+
     main()
