@@ -288,10 +288,6 @@ def display_score(score):
 # ---------------- APP ----------------
 def main():
 
-    st.set_page_config(
-        page_title="AI Resume Analyzer",
-        layout="wide"
-    )
 
     st.title("AI Resume Analyzer")
 
